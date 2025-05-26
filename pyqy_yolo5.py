@@ -15,10 +15,15 @@
 import sys
 import os
 import subprocess
+import ctypes
 from pathlib import Path
 from PyQt5.QtWidgets import *
-from PyQt5.QtCore import QThread, pyqtSignal, QSettings
+from PyQt5.QtCore import QThread, pyqtSignal, QSettings,QTimer
 from PyQt5.QtGui import QFont
+
+# Windows API定义
+if os.name == 'nt':
+    kernel32 = ctypes.windll.kernel32
 
 class TrainThread(QThread):
     update_log = pyqtSignal(str)
@@ -30,19 +35,29 @@ class TrainThread(QThread):
         self.command = command
         self.cwd = cwd
         self.process = None
+        self.pid = None
 
     def run(self):
         try:
+            # 创建独立的进程组（仅限Windows）
+            creationflags = 0
+            if os.name == 'nt':
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            
             self.process = subprocess.Popen(
                 self.command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 cwd=self.cwd,
-                shell=True if os.name == 'nt' else False
+                shell=True if os.name == 'nt' else False,
+                creationflags=creationflags
             )
+            self.pid = self.process.pid
+            
             for line in iter(self.process.stdout.readline, ''):
                 self.update_log.emit(line.strip())
+            
             self.process.wait()
             if self.process.returncode != 0:
                 self.error_occurred.emit(f"训练异常结束，错误码：{self.process.returncode}")
@@ -50,6 +65,17 @@ class TrainThread(QThread):
                 self.finished.emit()
         except Exception as e:
             self.error_occurred.emit(f"启动训练失败：{str(e)}")
+
+    def send_ctrl_c(self):
+        """发送Ctrl+C信号"""
+        if self.process and self.process.poll() is None:
+            if os.name == 'nt':
+                # Windows发送CTRL_C_EVENT
+                kernel32.GenerateConsoleCtrlEvent(0, self.pid)
+            else:
+                # Linux/Mac发送SIGINT
+                os.killpg(os.getpgid(self.pid), signal.SIGINT)
+            self.wait(2000)  # 等待2秒
 
 class YOLOTrainer(QMainWindow):
     def __init__(self):
@@ -237,14 +263,46 @@ class YOLOTrainer(QMainWindow):
 
     def stop_training(self):
         if self.train_thread and self.train_thread.isRunning():
-            self.train_thread.process.terminate()
-            self.train_thread.wait()
-            self.log_output.append("训练已中止")
+            self.stop_btn.setEnabled(False)
+            self.log_output.append("正在发送停止信号...")
+            
+            # 使用异步操作避免阻塞
+            QTimer.singleShot(0, self._safe_stop_training)
+
+    def _safe_stop_training(self):
+        """安全的停止训练流程"""
+        try:
+            # 发送Ctrl+C信号
+            self.train_thread.send_ctrl_c()
+            
+            # 检查是否真正退出
+            if self.train_thread.isRunning():
+                self.log_output.append("进程未正常退出，尝试强制终止...")
+                self.train_thread.process.kill()
+                self.train_thread.wait(1000)
+                
             self.training_finished()
+        except Exception as e:
+            self.log_output.append(f"停止失败: {str(e)}")
+        finally:
+            self.stop_btn.setEnabled(True)
 
     def training_finished(self):
+        """清理资源"""
+        if self.train_thread:
+            try:
+                if self.train_thread.process:
+                    self.train_thread.process.stdout.close()
+                    self.train_thread.process.stderr.close()
+                    self.train_thread.process = None
+            except:
+                pass
+            self.train_thread.quit()
+            self.train_thread.wait()
+            
         self.train_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.log_output.append("训练已停止")
 
     def show_error(self, message):
         QMessageBox.critical(self, "训练错误", message)
