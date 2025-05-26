@@ -17,6 +17,7 @@ import os
 import subprocess
 import ctypes
 from pathlib import Path
+import time
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import QThread, pyqtSignal, QSettings,QTimer
 from PyQt5.QtGui import QFont
@@ -29,6 +30,7 @@ class TrainThread(QThread):
     update_log = pyqtSignal(str)
     finished = pyqtSignal()
     error_occurred = pyqtSignal(str)
+    _running = True
 
     def __init__(self, command, cwd=None):
         super().__init__()
@@ -39,6 +41,7 @@ class TrainThread(QThread):
 
     def run(self):
         try:
+            self._running = True
             # 创建独立的进程组（仅限Windows）
             creationflags = 0
             if os.name == 'nt':
@@ -57,17 +60,29 @@ class TrainThread(QThread):
             
             for line in iter(self.process.stdout.readline, ''):
                 self.update_log.emit(line.strip())
-            
+            self._running = True
+            while self._running:
+                line = self.process.stdout.readline()
+                if not line:  # 管道关闭时退出循环
+                    break
+                self.update_log.emit(line.strip())
             self.process.wait()
             if self.process.returncode != 0:
                 self.error_occurred.emit(f"训练异常结束，错误码：{self.process.returncode}")
             else:
                 self.finished.emit()
         except Exception as e:
-            self.error_occurred.emit(f"启动训练失败：{str(e)}")
+            if "I/O operation on closed file" in str(e):
+                self.error_occurred.emit("训练已安全终止")
+            else:
+                self.error_occurred.emit(f"运行时错误: {str(e)}")
+        finally:
+            self._running = False
 
     def send_ctrl_c(self):
-        """发送Ctrl+C信号"""
+        """发送终止信号时同时停止读取循环"""
+        self._running = False  # 停止读取循环
+        start_time = time.time()
         if self.process and self.process.poll() is None:
             if os.name == 'nt':
                 # Windows发送CTRL_C_EVENT
@@ -75,7 +90,13 @@ class TrainThread(QThread):
             else:
                 # Linux/Mac发送SIGINT
                 os.killpg(os.getpgid(self.pid), signal.SIGINT)
-            self.wait(2000)  # 等待2秒
+            self.wait(1000)  # 等待1秒
+        #超时检测
+        while self.process.poll() is None and (time.time() - start_time) < 3:
+            time.sleep(0.1)
+        if self.process.poll() is None:
+            self.process.kill()
+        
 
 class YOLOTrainer(QMainWindow):
     def __init__(self):
@@ -105,11 +126,10 @@ class YOLOTrainer(QMainWindow):
 
     def create_widgets(self):
         # 路径配置部分
-        self.yolov5_root_input = self.create_path_input("YOLOv5根目录", is_file=False)
-        self.venv_python_input = self.create_path_input("Python环境路径", is_file=True)
-        self.data_yaml_input = self.create_path_input("数据集配置文件", is_file=True, 
-                                                    filter="YAML文件 (*.yaml *.yml)")
-
+        self.yolov5_root_group = self.create_path_group("YOLOv5根目录", is_file=False)
+        self.venv_python_group = self.create_path_group("Python环境路径", is_file=True)
+        self.data_yaml_group = self.create_path_group("数据集配置文件", is_file=True, 
+                                                     filter="YAML文件 (*.yaml *.yml)")
         # 训练参数部分
         self.model_select = QComboBox()
         self.model_select.addItems(['yolov5s', 'yolov5m', 'yolov5l', 'yolov5x'])
@@ -134,19 +154,20 @@ class YOLOTrainer(QMainWindow):
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
 
-    def create_path_input(self, label, is_file=False, filter=None):
-        container = QWidget()
-        layout = QHBoxLayout(container)
-        line_edit = QLineEdit()
-        line_edit.setFont(self.font)
-        browse_btn = QPushButton("浏览...")
-        browse_btn.clicked.connect(
-            lambda: self.select_path(line_edit, is_file, filter=filter)
-        )
+    def create_path_group(self, title, is_file=False, filter=None):
+        """创建包含路径输入框和浏览按钮的完整组"""
+        group = QGroupBox(title)
+        layout = QHBoxLayout(group)
         
-        layout.addWidget(line_edit)
-        layout.addWidget(browse_btn)
-        return (QGroupBox(label), container)
+        self.line_edit = QLineEdit()
+        self.line_edit.setFont(self.font)
+        self.browse_btn = QPushButton("浏览...")
+        self.browse_btn.clicked.connect(
+            lambda: self.select_path(self.line_edit, is_file, filter=filter))
+        
+        layout.addWidget(self.line_edit)
+        layout.addWidget(self.browse_btn)
+        return group
 
     def create_layout(self):
         main_widget = QWidget()
@@ -157,12 +178,11 @@ class YOLOTrainer(QMainWindow):
         config_panel = QWidget()
         config_layout = QVBoxLayout(config_panel)
 
-        # 添加路径配置
-        for widget in [self.yolov5_root_input, 
-                      self.venv_python_input,
-                      self.data_yaml_input]:
-            config_layout.addWidget(widget[0])
-            config_layout.addWidget(widget[1])
+        # 添加路径配置组（直接添加组对象）
+        config_layout.addWidget(self.yolov5_root_group)
+        config_layout.addWidget(self.venv_python_group)
+        config_layout.addWidget(self.data_yaml_group)
+
 
         # 添加训练参数
         params_group = QGroupBox("训练参数")
@@ -212,17 +232,21 @@ class YOLOTrainer(QMainWindow):
 
     def validate_paths(self):
         errors = []
-        paths_to_check = [
-            (self.yolov5_root_input[1].findChild(QLineEdit), 
-                ("YOLOv5根目录", lambda p: (p/"train.py").exists())),
-            (self.venv_python_input[1].findChild(QLineEdit), 
-                ("Python环境路径", lambda p: p.exists() and "python" in p.name.lower())),
-            (self.data_yaml_input[1].findChild(QLineEdit), 
-                ("数据集配置文件", lambda p: p.exists() and p.suffix in ['.yaml', '.yml']))
+        # 修改后的路径检查方式
+        path_checks = [
+            (self.yolov5_root_group, 
+             "YOLOv5根目录", 
+             lambda p: (p/"train.py").exists()),
+            (self.venv_python_group, 
+             "Python环境路径", 
+             lambda p: p.exists() and "python" in p.name.lower()),
+            (self.data_yaml_group, 
+             "数据集配置文件", 
+             lambda p: p.exists() and p.suffix in ['.yaml', '.yml'])
         ]
 
-        for (input_widget, (name, validator)) in paths_to_check:
-            path = Path(input_widget.text())
+        for group, name, validator in path_checks:
+            path = Path(self.get_path_from_group(group))
             if not path.exists():
                 errors.append(f"{name}不存在")
             elif not validator(path):
@@ -236,10 +260,21 @@ class YOLOTrainer(QMainWindow):
             return
 
         self.save_settings()
-        yolov5_root = Path(self.yolov5_root_input[1].findChild(QLineEdit).text())
-        venv_python = Path(self.venv_python_input[1].findChild(QLineEdit).text())
-        data_yaml = Path(self.data_yaml_input[1].findChild(QLineEdit).text())
+        yolov5_root = Path(self.get_path_from_group(self.yolov5_root_group))
+        venv_python = Path(self.get_path_from_group(self.venv_python_group))
+        data_yaml = Path(self.get_path_from_group(self.data_yaml_group))
+        
+        # 构造命令时需要验证模型文件路径
+        model_file = yolov5_root / "models" / f"{self.model_select.currentText()}.yaml"
+        if not model_file.exists():
+            QMessageBox.critical(self, "错误", f"模型配置文件 {model_file} 不存在")
+            return
 
+        # 构造权重文件路径时需要验证
+        weights_file = yolov5_root / f"{self.model_select.currentText()}.pt"
+        if not weights_file.exists():
+            QMessageBox.critical(self, "错误", f"预训练权重 {weights_file} 不存在")
+            return
         command = [
             str(venv_python.resolve()),
             str((yolov5_root / "train.py").resolve()),
@@ -247,8 +282,8 @@ class YOLOTrainer(QMainWindow):
             '--batch', str(self.batch_size.value()),
             '--epochs', str(self.epochs.value()),
             '--data', str(data_yaml.resolve()),  # 直接使用选择的YAML文件
-            '--cfg', str((yolov5_root / "models" / f"{self.model_select.currentText()}.yaml").resolve()),
-            '--weights', str((yolov5_root / f"{self.model_select.currentText()}.pt").resolve())
+            '--cfg', str(model_file.resolve()),
+            '--weights', str(weights_file.resolve())
         ]
 
         self.log_output.clear()
@@ -324,18 +359,21 @@ class YOLOTrainer(QMainWindow):
         else:
             event.accept()
 
+    def get_path_from_group(self, group):
+        """从路径组中获取输入框内容"""
+        return group.findChild(QLineEdit).text()
+
     def save_settings(self):
         settings = QSettings("YOLOv5Trainer", "Config")
-        settings.setValue("yolov5_root", self.yolov5_root_input[1].findChild(QLineEdit).text())
-        settings.setValue("venv_python", self.venv_python_input[1].findChild(QLineEdit).text())
-        settings.setValue("data_yaml", self.data_yaml_input[1].findChild(QLineEdit).text())
+        settings.setValue("yolov5_root", self.get_path_from_group(self.yolov5_root_group))
+        settings.setValue("venv_python", self.get_path_from_group(self.venv_python_group))
+        settings.setValue("data_yaml", self.get_path_from_group(self.data_yaml_group))
 
     def load_settings(self):
         settings = QSettings("YOLOv5Trainer", "Config")
-        self.yolov5_root_input[1].findChild(QLineEdit).setText(settings.value("yolov5_root", ""))
-        self.venv_python_input[1].findChild(QLineEdit).setText(settings.value("venv_python", ""))
-        self.data_yaml_input[1].findChild(QLineEdit).setText(settings.value("data_yaml", ""))
-
+        self.yolov5_root_group.findChild(QLineEdit).setText(settings.value("yolov5_root", ""))
+        self.venv_python_group.findChild(QLineEdit).setText(settings.value("venv_python", ""))
+        self.data_yaml_group.findChild(QLineEdit).setText(settings.value("data_yaml", ""))
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = YOLOTrainer()
